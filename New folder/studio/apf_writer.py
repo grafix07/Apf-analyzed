@@ -176,7 +176,7 @@ def write_apf_from_archive(source_apf: str | Path, output_apf: str | Path,
         p = dir_off
         end = dir_off + dir_size
         for i in range(entry_count):
-            nul = raw.find(b"\\0", p, end)
+            nul = raw.find(b"\0", p, end)
             if nul < 0 or p + 20 > end:
                 raise ValueError("Invalid APF directory entry.")
             name = raw[p:nul].decode("utf-8", "replace")
