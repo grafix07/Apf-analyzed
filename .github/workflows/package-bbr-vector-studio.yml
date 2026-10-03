@@ -39,5 +39,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: BBR_Vector_Studio_v1.04_Custom_Skin_Encoder
-          path: dist/BBR_Vector_Studio_v1.03_Existing_Skin_Replacement.zip
+          path: dist/BBR_Vector_Studio_v1.04_Custom_Skin_Encoder.zip
           if-no-files-found: error
