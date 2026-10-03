@@ -7,7 +7,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from vector_formats import APFArchive, TextureData
+from vector_formats import APFArchive, TextureData, parse_material_asset, material_path_for_mesh
 
 # Vector APF/FPUV uses a 64-byte header.  In particular, bytes 60..63 carry
 # the header integrity hash in the BBR2 packer.  Do not reduce this to 0x3C.
@@ -256,6 +256,116 @@ def find_skin_entries(arc: APFArchive, stem: str, asset_type: str) -> list[str]:
                   if _asset_leaf(e.path).startswith(target) or target.startswith(_asset_leaf(e.path))]
     return sorted(candidates, key=lambda p: (len(_asset_leaf(p)), len(p), p.lower()))[:1]
 
+
+
+_TEXTURE_REF_FIELDS = (
+    "diffuse_texture", "paint_texture", "decal_texture",
+    "decal_color_texture", "normal_texture", "mask_texture",
+    "env_texture", "additive_env_texture", "fresnel_texture",
+    "detail_texture", "one_bit_alpha_texture", "parallax_texture",
+)
+
+def _norm_texture_ref(value: str) -> str:
+    return str(value or "").replace("\\", "/").strip("/").lower()
+
+def _material_texture_refs(material_blob: bytes) -> list[str]:
+    try:
+        mat = parse_material_asset(material_blob, "Material")
+    except Exception:
+        return []
+    out=[]
+    for field in _TEXTURE_REF_FIELDS:
+        value=getattr(mat, field, "")
+        if value:
+            ref=_norm_texture_ref(value)
+            if ref and ref not in out:
+                out.append(ref)
+    return out
+
+def build_texture_usage_index(source_apf: str | Path) -> dict[str, list[str]]:
+    """Build a reverse map of VuTextureAsset references.
+
+    The skin exporter must not assume a texture belongs exclusively to a skin.
+    Materials are the authoritative reference layer between models and
+    textures, so index every material before allowing a replacement.
+    """
+    arc=APFArchive(source_apf)
+    try:
+        usage={}
+        for entry in arc.entries:
+            if not entry.path.lower().startswith("vumaterialasset/"):
+                continue
+            try:
+                refs=_material_texture_refs(arc.decode(entry))
+            except Exception:
+                continue
+            for ref in refs:
+                usage.setdefault(ref,[]).append(entry.path)
+        return usage
+    finally:
+        arc.close()
+
+def _usage_key_matches(target_path: str, ref: str) -> bool:
+    target=_norm_texture_ref(target_path)
+    ref=_norm_texture_ref(ref)
+    if target == ref:
+        return True
+    if target.startswith("vutextureasset/"):
+        target=target[len("vutextureasset/"):]
+    if ref.startswith("vutextureasset/"):
+        ref=ref[len("vutextureasset/"):]
+    return target == ref
+
+def skin_texture_paths(source_apf: str | Path, model, usage_index=None) -> list[str]:
+    """Return textures actually referenced by the selected model's materials."""
+    if model is None:
+        return []
+    arc=APFArchive(source_apf)
+    try:
+        paths=[]; seen=set()
+        for mesh in getattr(model, "meshes", []) or []:
+            mat_path=material_path_for_mesh(getattr(mesh, "name", ""))
+            entry=arc.get(mat_path)
+            if entry is None:
+                continue
+            try:
+                refs=_material_texture_refs(arc.decode(entry))
+            except Exception:
+                continue
+            for ref in refs:
+                logical=ref
+                if logical.startswith("vutextureasset/"):
+                    logical=logical[len("vutextureasset/"):]
+                tex_path="VuTextureAsset/"+logical
+                te=arc.get(tex_path)
+                if te is not None and tex_path not in seen:
+                    seen.add(tex_path); paths.append(tex_path)
+        return paths
+    finally:
+        arc.close()
+
+def texture_usage_diagnostics(source_apf: str | Path, target_texture_path: str,
+                              usage_index=None) -> dict:
+    """Describe why a texture is or is not safe for skin replacement."""
+    usage = usage_index if usage_index is not None else build_texture_usage_index(source_apf)
+    refs=[]
+    target=_norm_texture_ref(target_texture_path)
+    for ref, materials in usage.items():
+        if _usage_key_matches(target, ref):
+            refs.extend(materials)
+    refs=list(dict.fromkeys(refs))
+    ability_words=("ability","effect","pfx","powerup","victim","boost","shield","bomb","fire","rocket")
+    character_words=("character","driver","skin")
+    ability_refs=[p for p in refs if any(w in p.lower() for w in ability_words)]
+    character_refs=[p for p in refs if any(w in p.lower() for w in character_words)]
+    return {
+        "texture": target_texture_path,
+        "material_refs": refs,
+        "ability_refs": list(dict.fromkeys(ability_refs)),
+        "character_refs": list(dict.fromkeys(character_refs)),
+        "shared": len(refs)>1,
+        "ability_shared": bool(ability_refs),
+    }
 
 def build_existing_skin_replacement(source_apf: str | Path,
                                   target_texture_path: str,
