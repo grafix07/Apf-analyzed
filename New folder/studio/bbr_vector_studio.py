@@ -61,7 +61,7 @@ from external_animation import load_external_motion, mapping_report, auto_map_bo
 from fbx_motion import retarget_fbx, retarget_custom_fbx
 from fbx_character import CustomCharacter, load_fbx_character, skin_custom_mesh
 from custom_skin import load_skin_package, match_texture
-from apf_writer import (build_existing_skin_replacement, write_apf_from_archive,\n                            build_texture_usage_index, skin_texture_paths, texture_usage_diagnostics)
+from apf_writer import (\n    build_existing_skin_replacement, write_apf_from_archive,\n    build_texture_usage_index, skin_texture_paths, texture_usage_diagnostics,\n)
 from android_repack import (
     discover_apf_targets, repack_with_apf, signing_guidance,
     verify_repacked_apf
