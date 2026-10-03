@@ -262,6 +262,34 @@ def find_skin_entries(arc: APFArchive, stem: str, asset_type: str) -> list[str]:
     return sorted(candidates, key=lambda p: (len(_asset_leaf(p)), len(p), p.lower()))[:1]
 
 
+def build_existing_skin_replacement(source_apf: str | Path,
+                                  target_texture_path: str,
+                                  texture: TextureData) -> Tuple[Dict[str, bytes], dict]:
+    """Build a texture-only replacement for one already-shipped skin entry."""
+    arc = APFArchive(source_apf)
+    try:
+        entry = arc.get(str(target_texture_path))
+        if entry is None:
+            raise ValueError(f"Existing texture asset was not found: {target_texture_path}")
+        template = arc.decode(entry)
+        replacement_plain = encode_rgba8_texture(texture, template)
+        codec = arc.codec(entry)
+        if codec not in ("raw", "zlib"):
+            raise ValueError(
+                f"The selected skin uses APF codec '{codec}'. "
+                "This build will not silently change its codec."
+            )
+        return {entry.path: replacement_plain}, {
+            "path": entry.path,
+            "codec": codec,
+            "format": struct.unpack_from("<H", template, 0x16)[0] if len(template) >= 0x18 else None,
+            "original_unpacked_size": entry.unpacked_size,
+            "replacement_unpacked_size": len(replacement_plain),
+        }
+    finally:
+        arc.close()
+
+
 def build_skin_replacements(source_apf: str | Path, textures: Dict[str, TextureData],
                             texture_templates: Optional[Dict[str, bytes]] = None,
                             model_bytes: Optional[Dict[str, bytes]] = None) -> Tuple[Dict[str, bytes], list[str], list[str]]:
@@ -293,9 +321,9 @@ def build_skin_replacements(source_apf: str | Path, textures: Dict[str, TextureD
             if not paths:
                 missing.append("VuAnimatedModelAsset/" + key)
                 continue
-            for path in paths:
-                replacements[path] = bytes(blob)
-                matched.append(path)
+            # Texture-only skin export intentionally leaves the authored
+            # VuAnimatedModelAsset bytes untouched.
+            continue
     finally:
         arc.close()
     return replacements, matched, missing
