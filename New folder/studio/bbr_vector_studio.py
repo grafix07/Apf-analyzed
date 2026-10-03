@@ -4888,16 +4888,35 @@ class MainWindow(QMainWindow):
                 else:
                     context=[str(self.char_combo.currentText() or ""),
                              str(self.skin_combo.currentText() or ""),
-                             str(getattr(self.current_character,"name","") or "")]
-                tokens=[t.lower().replace(" ","_") for t in context if t and len(t)>1]
+                             str(getattr(self.current_character,"name","") or ""),
+                             str(getattr(self.current_character,"skin","") or "")]
+                tokens=[]
+                for value in context:
+                    value=str(value or "").lower().replace(" ","_").replace("\\","/")
+                    if value and len(value)>1:
+                        tokens.extend([value,Path(value).stem.lower()])
+                tokens=list(dict.fromkeys(tokens))
+                selected_skin=str(getattr(self.current_character,"skin","") or self.skin_combo.currentText() or "").lower().replace(" ","_")
+                selected_char=str(getattr(self.current_character,"name","") or self.char_combo.currentText() or "").lower().replace(" ","_")
 
                 def score(entry):
                     leaf=Path(entry.path.replace("\\","/")).stem.lower()
-                    return sum(2 if tok==leaf else 1 for tok in tokens if tok in leaf)
+                    points=0
+                    if selected_skin and leaf==selected_skin: points += 100
+                    if selected_skin and selected_skin in leaf: points += 40
+                    if selected_char and leaf==selected_char: points += 20
+                    if selected_char and selected_char in leaf: points += 5
+                    points += sum(3 if tok==leaf else 1 for tok in tokens if tok in leaf)
+                    return points
 
                 ranked=sorted(texture_entries,key=lambda e:(-score(e),len(e.path),e.path.lower()))
                 preferred=[e for e in ranked if score(e)>0]
-                candidates=preferred if preferred else ranked
+                # When a skin-specific texture exists, do not present generic
+                # shared character textures ahead of it. This prevents replacing
+                # a shared Cyber/base texture and making multiple character
+                # variants inherit the same outfit.
+                skin_specific=[e for e in preferred if selected_skin and selected_skin in Path(e.path.replace("\\","/")).stem.lower()]
+                candidates=skin_specific or preferred or ranked
                 # Avoid an unusable wall of duplicate paths in the selector.
                 candidates=candidates[:1500]
                 labels=[e.path for e in candidates]
