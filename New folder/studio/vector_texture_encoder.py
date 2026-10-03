@@ -36,7 +36,10 @@ def _pad4(a):
     out=np.zeros((ph,pw,4),dtype=np.uint8); out[:h,:w]=a; return out
 
 def _etc(a,fmt):
-    e=_etcpak(); a=_pad4(a); h,w=a.shape[:2]; raw=a.tobytes()
+    e=_etcpak(); a=_pad4(a); h,w=a.shape[:2]
+    # etcpak expects BGRA input for ETC encoders.
+    a=a[:,:, [2,1,0,3]]
+    raw=a.tobytes()
     if fmt==36196:return bytes(e.compress_etc1_rgb(raw,w,h))
     if fmt==37492:return bytes(e.compress_etc2_rgb(raw,w,h))
     if fmt in (37494,37496,37497):return bytes(e.compress_etc2_rgba(raw,w,h))
@@ -56,6 +59,20 @@ def encode_texture_data(rgba,template):
             else: payload.append(_etc(a,fmt))
         blob=b''.join(payload); vals=list(struct.unpack_from('<10I',hdr,8)); vals[4:8]=[w,h,mips,len(blob)]; struct.pack_into('<10I',hdr,8,*vals)
         return bytes(hdr)+blob
+    # Desktop BBR2 textures use a 65-byte header with DXGI format 28.
+    if len(template)>=65:
+        try:
+            dfmt=struct.unpack_from('<I',template,22)[0]
+            if dfmt==28:
+                hdr=bytearray(template[:65]); payload=[]
+                for a,mw,mh in _mips(rgba,mips,w,h):
+                    payload.append(a.tobytes())
+                blob=b''.join(payload)
+                struct.pack_into('<I',hdr,26,w); struct.pack_into('<I',hdr,30,h)
+                struct.pack_into('<I',hdr,34,mips); struct.pack_into('<I',hdr,38,len(blob))
+                return bytes(hdr)+blob
+        except Exception:
+            pass
     hdr=bytearray(template[:42]); fmt=struct.unpack_from('<H',hdr,0x16)[0]
     if fmt not in {5,17,18,19}: raise ValueError(f'Unsupported Vector texture format {fmt}.')
     e=_etcpak(); payload=[]
