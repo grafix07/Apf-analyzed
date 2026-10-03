@@ -1,0 +1,39 @@
+name: Package BBR Vector Studio
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax check
+        run: |
+          python -m compileall -q "New folder/studio"
+
+      - name: Package source
+        run: |
+          mkdir -p dist
+          cd "New folder"
+          zip -r "../dist/BBR_Vector_Studio_v1.02_Existing_Skin_Replacement.zip" . \
+            -x "README*" -x "*/__pycache__/*" -x "*.pyc"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BBR_Vector_Studio_v1.02_Existing_Skin_Replacement
+          path: dist/BBR_Vector_Studio_v1.02_Existing_Skin_Replacement.zip
+          if-no-files-found: error
