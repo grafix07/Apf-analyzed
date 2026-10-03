@@ -70,37 +70,8 @@ def _encode_bc3(rgba,w,h):
     return bytes(out)
 
 def _encode_texture_preserving_format(texture: TextureData, template: bytes) -> bytes:
-    rgba=np.asarray(texture.rgba,dtype=np.uint8)
-    if rgba.ndim != 3 or rgba.shape[2] != 4: raise ValueError('Custom skin texture must be RGBA8.')
-    if len(template) < 42: raise ValueError('Original texture BIN is too small.')
-    hdr=bytearray(template)
-    fmt=struct.unpack_from('<H',hdr,0x16)[0]
-    old_w=struct.unpack_from('<H',hdr,0x1A)[0]; old_h=struct.unpack_from('<H',hdr,0x1E)[0]
-    mips=max(1,struct.unpack_from('<H',hdr,0x22)[0])
-    # Keep the original dimensions unless the user supplied a genuinely different image.
-    h,w=rgba.shape[:2]
-    if (w,h)!=(old_w,old_h):
-        # Skin replacement should match the shipped texture dimensions; resizing avoids corrupt mip/layout metadata.
-        from PIL import Image
-        im=Image.fromarray(rgba,'RGBA').resize((old_w,old_h),Image.Resampling.LANCZOS)
-        rgba=np.asarray(im,dtype=np.uint8)
-        w,h=old_w,old_h
-    chunks=[]
-    from PIL import Image
-    base=Image.fromarray(rgba,'RGBA')
-    for level in range(mips):
-        mw=max(1,w>>level); mh=max(1,h>>level)
-        im=base if level==0 else base.resize((mw,mh),Image.Resampling.LANCZOS)
-        raw=np.asarray(im,dtype=np.uint8)
-        if fmt==5: chunks.append(raw.tobytes())
-        elif fmt in (17,18): chunks.append(_encode_bc1(raw,mw,mh))
-        elif fmt==19: chunks.append(_encode_bc3(raw,mw,mh))
-        else:
-            raise ValueError(f'Character skin texture format {fmt} cannot be safely re-encoded by this Studio build.')
-    payload=b''.join(chunks)
-    struct.pack_into('<H',hdr,0x1A,w); struct.pack_into('<H',hdr,0x1E,h)
-    struct.pack_into('<H',hdr,0x22,mips); struct.pack_into('<I',hdr,0x26,len(payload))
-    return bytes(hdr[:42])+payload
+    from vector_texture_encoder import encode_texture_data
+    return encode_texture_data(texture.rgba, template)
 
 def encode_rgba8_texture(texture: TextureData, template: Optional[bytes] = None) -> bytes:
     if template is None:
