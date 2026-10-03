@@ -152,15 +152,13 @@ def _compress(data: bytes, flags: int) -> Tuple[bytes, int]:
 
 def write_apf_from_archive(source_apf: str | Path, output_apf: str | Path,
                            replacements: Dict[str, bytes]) -> Dict[str, int]:
-    """Clone an APF using the runtime-compatible Vector packing layout.
+    """Patch an existing APF while preserving its original archive layout.
 
-    Critical invariants:
-      * preserve the complete 64-byte original header and unknown metadata;
-      * preserve original body order (directory order is not body order);
-      * copy every untouched payload byte-for-byte;
-      * use FNV-1a32 for replacement payload hashes;
-      * rebuild the directory and update its hash at header[20:24];
-      * update the trailing 4-byte header hash at bytes 60..63.
+    This is deliberately different from a full repack.  The original body,
+    directory offset, entry order, flags and all untouched bytes are retained.
+    Edited payloads are appended only when they do not fit in their original
+    slot; the directory records are then patched in place.  This avoids
+    rewriting special Vector entries such as Assets/AssetData.
     """
     src = Path(source_apf)
     out = Path(output_apf)
@@ -169,8 +167,6 @@ def write_apf_from_archive(source_apf: str | Path, output_apf: str | Path,
         if len(arc.mm) < HEADER_SIZE or bytes(arc.mm[:4]) != b"FPUV":
             raise ValueError("Not a supported Vector FPUV/APF archive.")
 
-        # Read the original directory directly so we preserve exact names,
-        # ordering and every field not intentionally changed.
         raw = bytes(arc.mm)
         _version, dir_off, entry_count, dir_size, _dir_hash = struct.unpack_from("<IIIII", raw, 4)
         if dir_off < HEADER_SIZE or dir_off + dir_size > len(raw):
@@ -180,77 +176,80 @@ def write_apf_from_archive(source_apf: str | Path, output_apf: str | Path,
         p = dir_off
         end = dir_off + dir_size
         for i in range(entry_count):
-            nul = raw.find(b"\0", p, end)
+            nul = raw.find(b"\\0", p, end)
             if nul < 0 or p + 20 > end:
                 raise ValueError("Invalid APF directory entry.")
             name = raw[p:nul].decode("utf-8", "replace")
             p = nul + 1
             off, usize, csize, checksum, flags = struct.unpack_from("<IIIII", raw, p)
             p += 20
-            if off < HEADER_SIZE or off + csize > dir_off:
-                raise ValueError(f"Invalid payload range for {name}.")
             entries.append({
                 "name": name, "orig_off": off, "usize": usize,
                 "csize": csize, "hash": checksum, "flags": flags,
+                "record_pos": p - 20,
             })
 
-        # Vector APFs store payloads in offset order, not necessarily directory order.
-        body_order = sorted(entries, key=lambda e: e["orig_off"])
-        body_start = min(e["orig_off"] for e in entries) if entries else HEADER_SIZE
-        if body_start < HEADER_SIZE:
-            raise ValueError("APF payload begins inside the header.")
-
-        out_bytes = bytearray(raw[:body_start])
+        # Start from an exact byte-for-byte copy.  Nothing is moved unless an
+        # edited payload has to be stored outside its original allocation.
+        out_bytes = bytearray(raw)
         replaced = 0
+        appended = 0
         changed_names = []
 
-        for e in body_order:
-            name = e["name"]
-            replacement = replacements.get(name)
-            if replacement is None:
-                e["new_off"] = len(out_bytes)
-                original = raw[e["orig_off"]:e["orig_off"] + e["csize"]]
-                out_bytes.extend(original)
-                e["new_usize"] = e["usize"]
-                e["new_csize"] = e["csize"]
-                e["new_hash"] = e["hash"]
-                e["new_flags"] = e["flags"]
-            else:
-                plain = bytes(replacement)
-                stored, new_flags = _compress(plain, e["flags"])
-                e["new_off"] = len(out_bytes)
-                out_bytes.extend(stored)
-                e["new_usize"] = len(plain)
-                e["new_csize"] = len(stored)
-                e["new_hash"] = fnv1a32(plain)
-                e["new_flags"] = new_flags
-                replaced += 1
-                changed_names.append(name)
-
-        # Rebuild only the directory records. Directory order remains exactly
-        # the original order.
-        directory = bytearray()
         for e in entries:
-            directory.extend(e["name"].encode("utf-8") + b"\0")
-            directory.extend(struct.pack(
-                "<IIIII",
-                e["new_off"], e["new_usize"], e["new_csize"],
-                e["new_hash"], e["new_flags"],
-            ))
+            replacement = replacements.get(e["name"])
+            if replacement is None:
+                continue
 
-        directory_offset = len(out_bytes)
-        out_bytes.extend(directory)
+            plain = bytes(replacement)
+            stored, new_flags = _compress(plain, e["flags"])
 
-        # Preserve all unknown header bytes. Only the fields known to change
-        # with a repack are rewritten.
+            old_off = int(e["orig_off"])
+            old_size = int(e["csize"])
+            old_end = old_off + old_size
+
+            # A replacement can safely occupy its original allocation when it
+            # fits.  Any unused tail is left untouched but excluded by csize.
+            # Do not allow a write to overlap the APF header or directory.
+            if old_off >= HEADER_SIZE and old_end <= dir_off and len(stored) <= old_size:
+                out_bytes[old_off:old_off + len(stored)] = stored
+                new_off = old_off
+            else:
+                # Some APFs contain special entries whose recorded ranges are
+                # not ordinary body allocations (notably Assets/AssetData).
+                # Never rewrite or relocate those bytes.  Append a new payload
+                # after the original file and point only the edited directory
+                # record at it.
+                new_off = len(out_bytes)
+                out_bytes.extend(stored)
+                appended += len(stored)
+
+            e["new_off"] = new_off
+            e["new_usize"] = len(plain)
+            e["new_csize"] = len(stored)
+            e["new_hash"] = fnv1a32(plain)
+            e["new_flags"] = new_flags
+            replaced += 1
+            changed_names.append(e["name"])
+
+        # Unchanged entries keep their original directory fields exactly.
+        # Changed records are patched at their original locations.
+        for e in entries:
+            if "new_off" not in e:
+                continue
+            struct.pack_into(
+                "<IIIII", out_bytes, e["record_pos"],
+                int(e["new_off"]), int(e["new_usize"]), int(e["new_csize"]),
+                int(e["new_hash"]), int(e["new_flags"])
+            )
+
+        # Keep the original directory offset/size/count.  Only its contents
+        # and integrity hash change.  This is substantially closer to an
+        # official patch/edit operation than rebuilding the entire archive.
+        directory = bytes(out_bytes[dir_off:dir_off + dir_size])
+        struct.pack_into("<I", out_bytes, 0x14, fnv1a32(directory))
+
         header = bytearray(out_bytes[:HEADER_SIZE])
-        struct.pack_into("<I", header, 0x08, directory_offset)
-        struct.pack_into("<I", header, 0x0C, len(entries))
-        struct.pack_into("<I", header, 0x10, len(directory))
-        struct.pack_into("<I", header, 0x14, fnv1a32(bytes(directory)))
-
-        # The working BBR packer computes the trailing header hash over all
-        # header bytes except the hash field itself.
         struct.pack_into("<I", header, 0x3C, fnv1a32(bytes(header[:0x3C])))
         out_bytes[:HEADER_SIZE] = header
 
@@ -263,13 +262,13 @@ def write_apf_from_archive(source_apf: str | Path, output_apf: str | Path,
         return {
             "entries": len(entries),
             "replaced": replaced,
+            "appended_bytes": appended,
             "size": out.stat().st_size,
-            "directory_size": len(directory),
+            "directory_size": dir_size,
             "header_size": HEADER_SIZE,
         }
     finally:
         arc.close()
-
 
 def _asset_leaf(path: str) -> str:
     return Path(str(path).replace("\\", "/")).name.lower()
