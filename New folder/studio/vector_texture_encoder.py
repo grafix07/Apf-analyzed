@@ -6,12 +6,20 @@ from PIL import Image
 ANDROID_FMTS={6407,6408,36196,37492,37494,37496,37497}
 
 def _read_format(data):
-    if len(data)>=48:
-        try:
-            v=struct.unpack_from('<10I',data,8)
-            if v[0] in (0,1) and v[1] in (0,2) and v[2] in {1,3,5,16,35,36}:
-                return v[2],v[3],v[4],v[5],max(1,v[6])
-        except Exception: pass
+    # BBR2 Android texture headers occur in two closely related layouts in
+    # extracted packages. In both, the useful 10-u32 record contains:
+    # prefix, kind, format, type, width, height, mipCount, payloadSize...
+    # Try both known record offsets before falling back to the legacy 42-byte
+    # Vector texture header.
+    for off in (8, 2):
+        if len(data) >= off + 40:
+            try:
+                v=struct.unpack_from('<10I',data,off)
+                fmt=int(v[2])
+                if fmt in ANDROID_FMTS or fmt in {1,3,5,16,35,36}:
+                    return fmt,int(v[3]),int(v[4]),int(v[5]),max(1,int(v[6]))
+            except Exception:
+                pass
     if len(data)>=42:
         fmt=struct.unpack_from('<H',data,0x16)[0]
         if fmt in {1,3,5,17,18,19}:
@@ -40,9 +48,9 @@ def _etc(a,fmt):
     # etcpak expects BGRA input for ETC encoders.
     a=a[:,:, [2,1,0,3]]
     raw=a.tobytes()
-    if fmt==36196:return bytes(e.compress_etc1_rgb(raw,w,h))
-    if fmt==37492:return bytes(e.compress_etc2_rgb(raw,w,h))
-    if fmt in (37494,37496,37497):return bytes(e.compress_etc2_rgba(raw,w,h))
+    if fmt in (36196,): return bytes(e.compress_etc1_rgb(raw,w,h))
+    if fmt in (37492,16): return bytes(e.compress_etc2_rgb(raw,w,h))
+    if fmt in (37494,37496,37497,35,36): return bytes(e.compress_etc2_rgba(raw,w,h))
     raise ValueError(f'Unsupported ETC format {fmt}.')
 
 def encode_texture_data(rgba,template):
