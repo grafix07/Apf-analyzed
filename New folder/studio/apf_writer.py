@@ -121,8 +121,33 @@ def _compress(data: bytes, flags: int) -> Tuple[bytes, int]:
         return data, int(flags)
     if hi == 1:
         return zlib.compress(data, 9), int(flags)
-    # The established BBR packer normalizes non-zlib compressed edits to zlib.
-    return zlib.compress(data, 9), (1 << 16) | lo
+    if hi == 4:
+        # Vector codec 4 is a raw LZ4 block (no frame header). The APF index
+        # already carries the uncompressed size, so store_size must be false.
+        # lz4 is part of this Studio's requirements.txt.
+        try:
+            import lz4.block
+        except Exception as exc:
+            raise ValueError(
+                "The selected skin uses LZ4 compression, but the lz4 package "
+                "is not installed. Install requirements.txt and try again."
+            ) from exc
+        return lz4.block.compress(data, store_size=False), int(flags)
+    if hi == 2:
+        # Vector raw-LZMA uses the APF index for the uncompressed size.
+        import lzma
+        props = bytes([0x5D]) + struct.pack("<I", 1 << 23)
+        payload = lzma.compress(
+            data, format=lzma.FORMAT_ALONE,
+            filters=[{"id": lzma.FILTER_LZMA1, "lc": 3, "lp": 0, "pb": 2, "dict_size": 1 << 23}]
+        )
+        # FORMAT_ALONE contains props + dict + an 8-byte size field. Vector
+        # raw-LZMA omits that size field and keeps the APF index authoritative.
+        return payload[:5] + payload[13:], int(flags)
+    raise ValueError(
+        "Unsupported APF compression codec %d for edited entry; refusing to "
+        "change the codec." % hi
+    )
 
 
 def write_apf_from_archive(source_apf: str | Path, output_apf: str | Path,
@@ -274,10 +299,10 @@ def build_existing_skin_replacement(source_apf: str | Path,
         template = arc.decode(entry)
         replacement_plain = encode_rgba8_texture(texture, template)
         codec = arc.codec(entry)
-        if codec not in ("raw", "zlib"):
+        if codec not in ("raw", "zlib", "lz4", "lzma-raw"):
             raise ValueError(
                 f"The selected skin uses APF codec '{codec}'. "
-                "This build will not silently change its codec."
+                "This build does not have a runtime-compatible encoder for it."
             )
         return {entry.path: replacement_plain}, {
             "path": entry.path,
