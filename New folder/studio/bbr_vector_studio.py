@@ -67,7 +67,7 @@ from android_repack import (
     verify_repacked_apf
 )
 
-APP_VERSION = "1.01"
+APP_VERSION = "1.02"
 APP_TITLE = f"BBR Vector Studio v{APP_VERSION}"
 
 
