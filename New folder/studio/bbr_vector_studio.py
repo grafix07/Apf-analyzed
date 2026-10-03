@@ -61,7 +61,7 @@ from external_animation import load_external_motion, mapping_report, auto_map_bo
 from fbx_motion import retarget_fbx, retarget_custom_fbx
 from fbx_character import CustomCharacter, load_fbx_character, skin_custom_mesh
 from custom_skin import load_skin_package, match_texture
-from apf_writer import build_skin_replacements, write_apf_from_archive
+from apf_writer import build_existing_skin_replacement, write_apf_from_archive
 from android_repack import (
     discover_apf_targets, repack_with_apf, signing_guidance,
     verify_repacked_apf
@@ -4846,63 +4846,135 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self,"Character skin import failed",str(exc))
 
     def export_custom_skin_apf(self, kind):
+        """Export by replacing one existing, shipped skin texture only.
+
+        The original APF remains untouched. The selected skin's existing
+        VuTextureAsset is used as the binary template and its authored
+        VuAnimatedModelAsset is never rewritten.
+        """
         data=self.custom_skin_export_data
         if not data or data.get("kind") != kind:
             QMessageBox.warning(self,"No custom skin","Import a custom skin first.")
             return
+
         source,_=QFileDialog.getOpenFileName(
-            self,"Choose original Assets.apf", "",
+            self,"Choose original Assets.apf","",
             "Vector APF (*.apf);;All files (*)")
         if not source:
             return
-        default=str(Path(source).with_name(Path(source).stem+"_CustomSkin.apf"))
-        output,_=QFileDialog.getSaveFileName(
-            self,"Export modified Assets.apf",default,
-            "Vector APF (*.apf);;All files (*)")
-        if not output:
+
+        textures=data.get("textures",{}) or {}
+        if not textures:
+            QMessageBox.warning(self,"No texture","The imported skin contains no decoded texture.")
             return
-        # Never overwrite the source archive. If the user selected the
-        # original Assets.apf, silently redirect to the default custom-skin
-        # filename instead of treating the export as a failure.
-        if Path(source).resolve()==Path(output).resolve():
-            output = str(Path(source).with_name(Path(source).stem + "_CustomSkin.apf"))
-            n = 2
-            while Path(output).resolve() == Path(source).resolve() or Path(output).exists():
-                output = str(Path(source).with_name(f"{Path(source).stem}_CustomSkin_{n}.apf"))
-                n += 1
+
+        from vector_formats import APFArchive
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            meta=data.get("meta",{})
-            replacements,matched,missing=build_skin_replacements(
-                source, data.get("textures",{}),
-                texture_templates=meta.get("texture_templates",{}),
-                model_bytes=meta.get("model_bytes",{}))
-            if not replacements:
-                raise ValueError("No matching skin assets were found in the selected Assets.apf.")
+            arc=APFArchive(source)
+            try:
+                texture_entries=[e for e in arc.entries if e.path.lower().startswith("vutextureasset/")]
+                if not texture_entries:
+                    raise ValueError("The selected Assets.apf contains no VuTextureAsset entries.")
+
+                # Prefer entries belonging to the currently selected vehicle/
+                # character. This keeps the list practical even for very large
+                # APFs while still allowing a different authored skin to be chosen.
+                context=[]
+                if kind=="vehicle":
+                    context=[str(self.vehicle_combo.currentText() or ""),
+                             str(self.vehicle_skin_combo.currentText() or ""),
+                             str(getattr(self.current_vehicle,"name","") or "")]
+                else:
+                    context=[str(self.char_combo.currentText() or ""),
+                             str(self.skin_combo.currentText() or ""),
+                             str(getattr(self.current_character,"name","") or "")]
+                tokens=[t.lower().replace(" ","_") for t in context if t and len(t)>1]
+
+                def score(entry):
+                    leaf=Path(entry.path.replace("\\","/")).stem.lower()
+                    return sum(2 if tok==leaf else 1 for tok in tokens if tok in leaf)
+
+                ranked=sorted(texture_entries,key=lambda e:(-score(e),len(e.path),e.path.lower()))
+                preferred=[e for e in ranked if score(e)>0]
+                candidates=preferred if preferred else ranked
+                # Avoid an unusable wall of duplicate paths in the selector.
+                candidates=candidates[:1500]
+                labels=[e.path for e in candidates]
+
+                target,ok=QInputDialog.getItem(
+                    self,
+                    f"Select existing {kind} skin to replace",
+                    "Existing VuTextureAsset:",
+                    labels,0,True)
+                if not ok or not target:
+                    return
+
+                custom_keys=list(textures.keys())
+                custom_labels=[str(k) for k in custom_keys]
+                custom_key,ok=QInputDialog.getItem(
+                    self,
+                    "Select custom texture",
+                    "Imported texture:",
+                    custom_labels,0,True)
+                if not ok or not custom_key:
+                    return
+                custom_texture=textures[custom_key]
+            finally:
+                arc.close()
+
+            default=str(Path(source).with_name(
+                Path(source).stem + f"_{kind}_CustomSkin.apf"))
+            output,_=QFileDialog.getSaveFileName(
+                self,"Export modified Assets.apf",default,
+                "Vector APF (*.apf);;All files (*)")
+            if not output:
+                return
+
+            if Path(source).resolve()==Path(output).resolve():
+                output=str(Path(source).with_name(
+                    Path(source).stem + f"_{kind}_CustomSkin.apf"))
+                n=2
+                while Path(output).resolve()==Path(source).resolve() or Path(output).exists():
+                    output=str(Path(source).with_name(
+                        f"{Path(source).stem}_{kind}_CustomSkin_{n}.apf"))
+                    n+=1
+
+            replacements,detail=build_existing_skin_replacement(
+                source,target,custom_texture)
             stats=write_apf_from_archive(source,output,replacements)
-            # Re-open the generated archive to make sure the index and every
-            # replacement payload can be decoded by the same Studio parser.
-            from vector_formats import APFArchive
+
+            # Runtime-oriented verification: the selected entry must decode,
+            # while every other APF entry remains structurally readable.
             check=APFArchive(output)
             try:
-                for path in replacements:
-                    e=check.get(path)
-                    if e is None:
-                        raise ValueError(f"Export verification failed: missing {path}")
-                    check.decode(e)
+                entry=check.get(target)
+                if entry is None:
+                    raise ValueError(f"Export verification failed: missing {target}")
+                decoded=check.decode(entry)
+                if len(decoded)!=int(entry.unpacked_size):
+                    raise ValueError(f"Export verification failed: size mismatch for {target}")
             finally:
                 check.close()
-            msg=(f"Assets.apf exported successfully:\n{output}\n\n"
-                 f"Replaced assets: {stats['replaced']}\n"
-                 f"Matched texture/model entries: {len(matched)}")
-            if missing:
-                msg += "\n\nNot found in Assets.apf:\n" + "\n".join(missing[:20])
-                if len(missing)>20: msg += f"\n… and {len(missing)-20} more"
-            msg += "\n\nThe original Assets.apf was not modified."
+
+            fmt=detail.get("format")
+            codec=detail.get("codec")
+            msg=(
+                f"Existing {kind} skin replaced successfully:\n{output}\n\n"
+                f"Target: {target}\n"
+                f"Format: {fmt} • APF codec: {codec}\n"
+                f"Replaced entries: {stats['replaced']}\n\n"
+                "Only the selected existing VuTextureAsset was changed. "
+                "The original VuAnimatedModelAsset and all unrelated assets were left untouched.\n\n"
+                "The original Assets.apf was not modified."
+            )
             QMessageBox.information(self,"Custom skin APF export",msg)
-            self.statusBar().showMessage(f"Custom {kind} skin exported: {output}")
+            self.statusBar().showMessage(
+                f"Custom {kind} skin exported by replacing existing asset: {Path(output).name}")
         except Exception as exc:
-            QMessageBox.critical(self,"Custom skin APF export failed",f"{exc}\n\n{traceback.format_exc()}")
+            QMessageBox.critical(
+                self,"Custom skin APF export failed",
+                f"{exc}\n\n{traceback.format_exc()}")
         finally:
             QApplication.restoreOverrideCursor()
 
